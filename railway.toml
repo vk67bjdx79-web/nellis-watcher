@@ -1,0 +1,11 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python scripts/nellis_watcher.py"
+healthcheckPath = "/"
+healthcheckTimeout = 30
+restartPolicyType = "always"
+
+[nixpacks]
+pythonVersion = "3.11"
