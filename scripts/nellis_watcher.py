@@ -63,12 +63,11 @@ ALGOLIA_HEADERS = {
 NELLIS_HOUSTON_URL = "https://www.nellisauction.com/browse?location=houston"
 
 # ── Tuning knobs ──────────────────────────────────────────────────────────────
-MAX_BIDS        = 2
+MAX_BIDS        = 5
 MIN_RETAIL      = 100.0
 MAX_CURRENT_BID = 5.0
 ALERT_WINDOW    = 300    # notify when < this many seconds remain (5 min)
 LOOK_AHEAD      = 3600   # only fetch items closing within 1 hour
-MIN_SCORE       = 7      # minimum opportunity score (1-10) to trigger alert
 
 # ── Smart scheduling ──────────────────────────────────────────────────────────
 HOUSTON_TZ         = ZoneInfo("America/Chicago")
@@ -339,8 +338,6 @@ def check_and_alert(hits: list[dict], now: int) -> int:
 
         retail = item.get("Suggested Retail", 0)
         score  = opportunity_score(retail, secs_left)
-        if score < MIN_SCORE:
-            continue
 
         notified.add(obj_id)
         alerted += 1
@@ -426,7 +423,7 @@ def run() -> None:
     print(
         f"Nellis Houston Watcher — started {_stats['started']}\n"
         f"  Filter : ≤{MAX_BIDS} bids | bid ≤ ${MAX_CURRENT_BID:.2f} | "
-        f"retail > ${MIN_RETAIL} | score ≥ {MIN_SCORE}/10 | alert < {ALERT_WINDOW//60}m\n"
+        f"retail > ${MIN_RETAIL} | alert < {ALERT_WINDOW//60}m\n"
         f"  Schedule: {PEAK_POLL_INTERVAL}s (5–10 PM CST)  |  {OFF_POLL_INTERVAL}s otherwise\n"
         f"  Health  : http://0.0.0.0:{HTTP_PORT}/\n"
         f"  Sheets  : {'configured ✓' if _sheet else 'not configured'}\n"
