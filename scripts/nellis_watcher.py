@@ -91,9 +91,10 @@ _SHEET_HEADERS = [
 ]
 
 # ── Persistent state ──────────────────────────────────────────────────────────
-# Maps objectID -> list of stages already sent, e.g. ["5min"] or ["5min", "2min"]
-notified: dict[str, list[str]] = {}
-NOTIFIED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notified_items.json")
+# Maps objectID -> {"stages": ["5min", "2min"], "ts": unix_timestamp_first_seen}
+notified: dict[str, dict] = {}
+NOTIFIED_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notified_items.json")
+PRUNE_AFTER    = 86400   # remove entries older than 24 hours (seconds)
 
 _stats: dict = {"polls": 0, "notified": 0, "last_poll": "never", "started": ""}
 HTTP_PORT = int(os.environ.get("PORT", 8080))
@@ -102,12 +103,19 @@ HTTP_PORT = int(os.environ.get("PORT", 8080))
 # ── Persistence helpers ───────────────────────────────────────────────────────
 
 def _load_notified() -> None:
-    """Load previously notified items from disk to survive restarts."""
+    """Load previously notified items from disk; migrate old list format if needed."""
     if not os.path.exists(NOTIFIED_FILE):
         return
     try:
         with open(NOTIFIED_FILE) as f:
-            notified.update(json.load(f))
+            data = json.load(f)
+        now = int(time.time())
+        for obj_id, entry in data.items():
+            if isinstance(entry, list):
+                # Migrate old format: give it current ts so it prunes in 24h
+                notified[obj_id] = {"stages": entry, "ts": now}
+            else:
+                notified[obj_id] = entry
         print(f"  Loaded {len(notified)} previously notified item(s) from disk")
     except Exception as exc:
         print(f"  [WARN] Could not load notified file: {exc}")
@@ -120,6 +128,20 @@ def _save_notified() -> None:
             json.dump(notified, f)
     except Exception as exc:
         print(f"  [WARN] Could not save notified file: {exc}")
+
+
+def _prune_notified() -> None:
+    """Remove entries older than PRUNE_AFTER seconds (24 hours)."""
+    cutoff    = int(time.time()) - PRUNE_AFTER
+    to_delete = [
+        obj_id for obj_id, entry in notified.items()
+        if entry.get("ts", 0) < cutoff
+    ]
+    if to_delete:
+        for obj_id in to_delete:
+            del notified[obj_id]
+        _save_notified()
+        print(f"  Pruned {len(to_delete)} expired notified item(s) (>{PRUNE_AFTER//3600}h old)")
 
 
 # ── Flask health server ───────────────────────────────────────────────────────
@@ -364,7 +386,9 @@ def check_and_alert(hits: list[dict], now: int) -> int:
         if secs_left >= FIRST_ALERT:
             continue   # not in alert zone yet
 
-        stages_done = set(notified.get(obj_id, []))
+        entry       = notified.get(obj_id, {})
+        stages_done = set(entry.get("stages", []))
+        first_ts    = entry.get("ts", now)   # preserve original timestamp
         need_first  = "5min" not in stages_done
         need_second = "2min" not in stages_done and secs_left < SECOND_ALERT
 
@@ -467,7 +491,7 @@ def check_and_alert(hits: list[dict], now: int) -> int:
             alerted += 1
 
         # ── Persist updated stages ──────────────────────────────────────────
-        notified[obj_id] = list(stages_done)
+        notified[obj_id] = {"stages": list(stages_done), "ts": first_ts}
         _save_notified()
 
     return alerted
@@ -487,6 +511,7 @@ def run() -> None:
 
     threading.Thread(target=_start_health_server, daemon=True).start()
     _load_notified()
+    _prune_notified()
     _init_sheets()
 
     print(
@@ -499,10 +524,17 @@ def run() -> None:
         f"  Pushover: {'configured ✓' if PUSHOVER_API_TOKEN else 'NOT configured'}\n"
     )
 
+    last_prune = int(time.time())
+
     while True:
         now      = int(time.time())
         ts       = datetime.now().strftime("%H:%M:%S")
         interval = current_poll_interval()
+
+        # Prune stale entries once per hour
+        if now - last_prune >= 3600:
+            _prune_notified()
+            last_prune = now
 
         hits = fetch_qualifying_items(now)
         _stats["polls"]    += 1
