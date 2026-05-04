@@ -4,17 +4,20 @@ Nellis Auction Houston Watcher
 ==============================
 Polls the Algolia search index used by nellisauction.com every N seconds.
 Finds Houston items with:
-  - 0-2 total bids
+  - 0-5 total bids
   - Current bid <= $5
   - Estimated retail > $100
-  - Opportunity score >= 7/10
-  - Less than 5 minutes remaining
 
-Features:
-  - Item photo attached to Pushover notifications
+Two alerts per qualifying item — no more, no less:
+  1. "5 min" alert  — fired when < 5 minutes remain (includes eBay data + photo)
+  2. "2 min" alert  — fired when < 2 minutes remain (urgent nudge)
+
+Notified items are persisted to disk so duplicates are avoided across restarts.
+
+Other features:
   - Smart scheduling: 15s (5pm-10pm CST), 3min otherwise
-  - Opportunity score 1-10 (ROI + urgency + bid scarcity)
-  - eBay sold price lookup + profit estimate
+  - Opportunity score 1-10 shown in notifications (not used to block)
+  - eBay sold price lookup + profit estimate (first alert only)
   - Google Sheets logging (optional via env vars)
   - Flask health check on PORT (default 8080)
 """
@@ -66,7 +69,8 @@ NELLIS_HOUSTON_URL = "https://www.nellisauction.com/browse?location=houston"
 MAX_BIDS        = 5
 MIN_RETAIL      = 100.0
 MAX_CURRENT_BID = 5.0
-ALERT_WINDOW    = 300    # notify when < this many seconds remain (5 min)
+FIRST_ALERT     = 300    # seconds — send first alert when < 5 min remain
+SECOND_ALERT    = 120    # seconds — send second alert when < 2 min remain
 LOOK_AHEAD      = 3600   # only fetch items closing within 1 hour
 
 # ── Smart scheduling ──────────────────────────────────────────────────────────
@@ -83,16 +87,42 @@ _SHEETS_SCOPES          = ["https://www.googleapis.com/auth/spreadsheets"]
 _SHEET_HEADERS = [
     "Timestamp", "Title", "Current Price (est.)", "Retail Value",
     "eBay Sold Price", "eBay Sold Date", "Est. Profit",
-    "Score", "Time Left", "URL",
+    "Score", "Alert Stage", "Time Left", "URL",
 ]
 
-# ── State ─────────────────────────────────────────────────────────────────────
-notified: set[str] = set()
+# ── Persistent state ──────────────────────────────────────────────────────────
+# Maps objectID -> list of stages already sent, e.g. ["5min"] or ["5min", "2min"]
+notified: dict[str, list[str]] = {}
+NOTIFIED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notified_items.json")
+
 _stats: dict = {"polls": 0, "notified": 0, "last_poll": "never", "started": ""}
 HTTP_PORT = int(os.environ.get("PORT", 8080))
 
 
-# ── Flask health server ────────────────────────────────────────────────────────
+# ── Persistence helpers ───────────────────────────────────────────────────────
+
+def _load_notified() -> None:
+    """Load previously notified items from disk to survive restarts."""
+    if not os.path.exists(NOTIFIED_FILE):
+        return
+    try:
+        with open(NOTIFIED_FILE) as f:
+            notified.update(json.load(f))
+        print(f"  Loaded {len(notified)} previously notified item(s) from disk")
+    except Exception as exc:
+        print(f"  [WARN] Could not load notified file: {exc}")
+
+
+def _save_notified() -> None:
+    """Persist current notified dict to disk."""
+    try:
+        with open(NOTIFIED_FILE, "w") as f:
+            json.dump(notified, f)
+    except Exception as exc:
+        print(f"  [WARN] Could not save notified file: {exc}")
+
+
+# ── Flask health server ───────────────────────────────────────────────────────
 
 _app = Flask(__name__)
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
@@ -122,11 +152,11 @@ def _init_sheets() -> None:
         print("  Google Sheets: GOOGLE_CREDENTIALS_JSON / GOOGLE_SHEET_ID not set — skipping")
         return
     try:
-        creds_dict   = json.loads(GOOGLE_CREDENTIALS_JSON)
-        creds        = SACredentials.from_service_account_info(creds_dict, scopes=_SHEETS_SCOPES)
-        client       = gspread.authorize(creds)
-        spreadsheet  = client.open_by_key(GOOGLE_SHEET_ID)
-        _sheet       = spreadsheet.sheet1
+        creds_dict  = json.loads(GOOGLE_CREDENTIALS_JSON)
+        creds       = SACredentials.from_service_account_info(creds_dict, scopes=_SHEETS_SCOPES)
+        client      = gspread.authorize(creds)
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        _sheet      = spreadsheet.sheet1
         if not _sheet.row_values(1):
             _sheet.append_row(_SHEET_HEADERS)
         print("  Google Sheets: connected ✓")
@@ -148,24 +178,22 @@ def _log_to_sheets(row: list) -> None:
 
 def opportunity_score(retail: float, secs_left: int) -> int:
     """
-    Score 1-10:
-      Bid scarcity  3 pts  (fixed — all items have 0-2 bids)
+    Score 1-10 (shown in notifications, not used to filter):
+      Bid scarcity  3 pts  (fixed — all items have 0-5 bids, still scarce)
       ROI           1-4 pts (retail / $5 max bid)
       Urgency       0-3 pts (time remaining)
-
-    Threshold: MIN_SCORE (default 7) triggers a Pushover alert.
     """
-    score = 3  # bid scarcity always max given the <=2 bids filter
+    score = 3  # bid scarcity baseline
 
     roi = retail / MAX_CURRENT_BID
-    if roi >= 60:        score += 4   # retail >= $300
-    elif roi >= 40:      score += 3   # retail >= $200
-    elif roi >= 20:      score += 2   # retail >= $100
-    else:                score += 1
+    if roi >= 60:    score += 4   # retail >= $300
+    elif roi >= 40:  score += 3   # retail >= $200
+    elif roi >= 20:  score += 2   # retail >= $100
+    else:            score += 1
 
-    if secs_left < 120:              score += 3   # < 2 min
-    elif secs_left < 240:            score += 2   # < 4 min
-    elif secs_left < ALERT_WINDOW:   score += 1   # < 5 min
+    if secs_left < 120:           score += 3   # < 2 min
+    elif secs_left < 240:         score += 2   # < 4 min
+    elif secs_left < FIRST_ALERT: score += 1   # < 5 min
 
     return min(10, max(1, score))
 
@@ -183,9 +211,8 @@ _EBAY_HEADERS = {
 
 
 def _clean_title_for_search(title: str) -> str:
-    """Strip auction noise and return first ~50 chars for eBay search."""
-    cleaned = re.sub(r"\*\*.*?\*\*", "", title)   # remove **NOTE** blocks
-    cleaned = re.sub(r"\(.*?\)", "", cleaned)       # remove parentheticals
+    cleaned = re.sub(r"\*\*.*?\*\*", "", title)
+    cleaned = re.sub(r"\(.*?\)", "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if len(cleaned) > 50:
         cleaned = cleaned[:50].rsplit(" ", 1)[0]
@@ -193,10 +220,7 @@ def _clean_title_for_search(title: str) -> str:
 
 
 def fetch_ebay_sold(title: str) -> tuple[float | None, str | None]:
-    """
-    Scrape eBay completed listings sorted by most recent.
-    Returns (sold_price, sold_date_str) or (None, None) on failure.
-    """
+    """Scrape eBay completed listings. Returns (price, date) or (None, None)."""
     query = _clean_title_for_search(title)
     if not query:
         return None, None
@@ -211,8 +235,7 @@ def fetch_ebay_sold(title: str) -> tuple[float | None, str | None]:
         return None, None
 
     soup  = BeautifulSoup(resp.text, "lxml")
-    items = soup.select(".s-item")
-    for item in items:
+    for item in soup.select(".s-item"):
         title_el = item.select_one(".s-item__title")
         if not title_el or "Shop on eBay" in title_el.text:
             continue
@@ -221,7 +244,7 @@ def fetch_ebay_sold(title: str) -> tuple[float | None, str | None]:
         if not price_el:
             continue
 
-        price_text  = price_el.text.strip().split(" to ")[0]   # handle ranges
+        price_text  = price_el.text.strip().split(" to ")[0]
         price_match = re.search(r"[\d,]+\.?\d*", price_text.replace(",", ""))
         if not price_match:
             continue
@@ -275,7 +298,7 @@ def send_pushover(
             if len(img_bytes) <= 2_500_000:
                 files = {"attachment": ("photo.jpg", io.BytesIO(img_bytes), "image/jpeg")}
         except Exception:
-            pass   # send without photo rather than fail
+            pass
 
     try:
         if files:
@@ -323,30 +346,38 @@ def fetch_qualifying_items(now: int) -> list[dict]:
         return []
 
 
-# ── Alert logic ───────────────────────────────────────────────────────────────
+# ── Two-stage alert logic ─────────────────────────────────────────────────────
 
 def check_and_alert(hits: list[dict], now: int) -> int:
+    """
+    For each qualifying item fire at most two alerts:
+      Stage "5min" — when secs_left < FIRST_ALERT  (5 min)
+      Stage "2min" — when secs_left < SECOND_ALERT (2 min)
+    Each stage fires exactly once per item. Notified state persisted to disk.
+    """
     alerted = 0
+
     for item in hits:
         obj_id    = item.get("objectID", "")
         secs_left = int(item.get("Time Remaining", 0)) - now
 
-        if secs_left >= ALERT_WINDOW:
-            continue
-        if obj_id in notified:
-            continue
+        if secs_left >= FIRST_ALERT:
+            continue   # not in alert zone yet
 
-        retail = item.get("Suggested Retail", 0)
-        score  = opportunity_score(retail, secs_left)
+        stages_done = set(notified.get(obj_id, []))
+        need_first  = "5min" not in stages_done
+        need_second = "2min" not in stages_done and secs_left < SECOND_ALERT
 
-        notified.add(obj_id)
-        alerted += 1
+        if not need_first and not need_second:
+            continue   # both stages already sent for this item
 
+        # ── Common item fields ──────────────────────────────────────────────
+        retail     = item.get("Suggested Retail", 0)
+        score      = opportunity_score(retail, secs_left)
         title_text = item.get("Lead Description", "Unknown Item")
         location   = item.get("Location Name", "Houston")
         clerk_id   = item.get("ClerkId", "")
         photo      = item.get("Photo", "")
-
         if isinstance(photo, list):
             photo = photo[0] if photo else ""
 
@@ -359,48 +390,85 @@ def check_and_alert(hits: list[dict], now: int) -> int:
             if clerk_id else NELLIS_HOUSTON_URL
         )
 
-        # eBay lookup
-        ebay_price, ebay_date = fetch_ebay_sold(title_text)
-        profit = calc_profit(ebay_price) if ebay_price is not None else None
+        # ── Stage 1: 5-minute alert ─────────────────────────────────────────
+        if need_first:
+            ebay_price, ebay_date = fetch_ebay_sold(title_text)
+            profit = calc_profit(ebay_price) if ebay_price is not None else None
 
-        # Build Pushover message
-        pushover_title = f"[{score}/10] Nellis — {time_str} left!"
-        msg_lines = [
-            title_text[:80],
-            f"Retail: ${retail:,.2f}  |  Score: {score}/10",
-            f"Location: {location}  |  {time_str} remaining",
-        ]
-        if ebay_price is not None:
-            msg_lines.append(f"eBay sold: ${ebay_price:,.2f} ({ebay_date})")
-            msg_lines.append(f"Est. profit: ${profit:+,.2f} after fees + shipping")
-        else:
-            msg_lines.append("eBay: no recent sold data")
-        pushover_msg = "\n".join(msg_lines)
+            push_title = f"[{score}/10] 5 MIN — Nellis Deal!"
+            msg_lines  = [
+                title_text[:80],
+                f"Retail: ${retail:,.2f}  |  Score: {score}/10",
+                f"Location: {location}  |  ~5 min remaining",
+            ]
+            if ebay_price is not None:
+                msg_lines.append(f"eBay sold: ${ebay_price:,.2f} ({ebay_date})")
+                msg_lines.append(f"Est. profit: ${profit:+,.2f} after fees + shipping")
+            else:
+                msg_lines.append("eBay: no recent sold data")
 
-        # Console
-        print(f"\n{'='*64}")
-        print(f"MATCH  {title_text[:70]}")
-        print(f"  Retail: ${retail:,.2f}  |  Score: {score}/10  |  {time_str} left")
-        if ebay_price is not None:
-            print(f"  eBay: ${ebay_price:,.2f} ({ebay_date}) | Profit: ${profit:+,.2f}")
-        print(f"  Link: {item_url}")
-        print(f"{'='*64}\n")
+            print(f"\n{'='*64}")
+            print(f"5MIN   {title_text[:70]}")
+            print(f"  Retail: ${retail:,.2f}  |  Score: {score}/10  |  {time_str} left")
+            if ebay_price is not None:
+                print(f"  eBay: ${ebay_price:,.2f} ({ebay_date}) | Profit: ${profit:+,.2f}")
+            print(f"  Link: {item_url}")
+            print(f"{'='*64}\n")
 
-        send_pushover(pushover_title, pushover_msg, url=item_url, photo_url=photo)
+            send_pushover(push_title, "\n".join(msg_lines), url=item_url, photo_url=photo)
 
-        # Sheets log
-        _log_to_sheets([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            title_text[:120],
-            f"<=${MAX_CURRENT_BID:.2f}",
-            f"${retail:,.2f}",
-            f"${ebay_price:,.2f}" if ebay_price is not None else "",
-            ebay_date or "",
-            f"${profit:+,.2f}" if profit is not None else "",
-            f"{score}/10",
-            time_str,
-            item_url,
-        ])
+            _log_to_sheets([
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                title_text[:120],
+                f"<=${MAX_CURRENT_BID:.2f}",
+                f"${retail:,.2f}",
+                f"${ebay_price:,.2f}" if ebay_price is not None else "",
+                ebay_date or "",
+                f"${profit:+,.2f}" if profit is not None else "",
+                f"{score}/10",
+                "5min",
+                time_str,
+                item_url,
+            ])
+
+            stages_done.add("5min")
+            alerted += 1
+
+        # ── Stage 2: 2-minute alert ─────────────────────────────────────────
+        if need_second:
+            push_title = f"[{score}/10] 2 MIN — BID NOW!"
+            push_msg   = (
+                f"{title_text[:80]}\n"
+                f"Retail: ${retail:,.2f}  |  Score: {score}/10\n"
+                f"{time_str} remaining — FINAL CHANCE!"
+            )
+
+            print(f"\n{'='*64}")
+            print(f"2MIN   {title_text[:70]}")
+            print(f"  Retail: ${retail:,.2f}  |  Score: {score}/10  |  {time_str} left")
+            print(f"  Link: {item_url}")
+            print(f"{'='*64}\n")
+
+            send_pushover(push_title, push_msg, url=item_url, photo_url=photo)
+
+            _log_to_sheets([
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                title_text[:120],
+                f"<=${MAX_CURRENT_BID:.2f}",
+                f"${retail:,.2f}",
+                "", "", "",
+                f"{score}/10",
+                "2min",
+                time_str,
+                item_url,
+            ])
+
+            stages_done.add("2min")
+            alerted += 1
+
+        # ── Persist updated stages ──────────────────────────────────────────
+        notified[obj_id] = list(stages_done)
+        _save_notified()
 
     return alerted
 
@@ -418,12 +486,13 @@ def run() -> None:
     _stats["started"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     threading.Thread(target=_start_health_server, daemon=True).start()
+    _load_notified()
     _init_sheets()
 
     print(
         f"Nellis Houston Watcher — started {_stats['started']}\n"
-        f"  Filter : ≤{MAX_BIDS} bids | bid ≤ ${MAX_CURRENT_BID:.2f} | "
-        f"retail > ${MIN_RETAIL} | alert < {ALERT_WINDOW//60}m\n"
+        f"  Filter  : ≤{MAX_BIDS} bids | bid ≤ ${MAX_CURRENT_BID:.2f} | retail > ${MIN_RETAIL}\n"
+        f"  Alerts  : stage 1 at <{FIRST_ALERT//60}min | stage 2 at <{SECOND_ALERT//60}min\n"
         f"  Schedule: {PEAK_POLL_INTERVAL}s (5–10 PM CST)  |  {OFF_POLL_INTERVAL}s otherwise\n"
         f"  Health  : http://0.0.0.0:{HTTP_PORT}/\n"
         f"  Sheets  : {'configured ✓' if _sheet else 'not configured'}\n"
@@ -436,24 +505,21 @@ def run() -> None:
         interval = current_poll_interval()
 
         hits = fetch_qualifying_items(now)
-        _stats["polls"]     += 1
-        _stats["last_poll"]  = ts
+        _stats["polls"]    += 1
+        _stats["last_poll"] = ts
 
-        alert_ready = [
-            h for h in hits
-            if int(h.get("Time Remaining", 0)) - now < ALERT_WINDOW
-        ]
+        in_first  = [h for h in hits if int(h.get("Time Remaining", 0)) - now < FIRST_ALERT]
+        in_second = [h for h in hits if int(h.get("Time Remaining", 0)) - now < SECOND_ALERT]
 
         print(
             f"[{ts}] {len(hits)} item(s) in window | "
-            f"{len(alert_ready)} in alert zone | "
+            f"{len(in_first)} <5min | {len(in_second)} <2min | "
             f"next in {interval}s"
         )
 
         if hits:
-            before = _stats["notified"]
-            check_and_alert(hits, now)
-            _stats["notified"] += len(notified) - before
+            new_alerts = check_and_alert(hits, now)
+            _stats["notified"] += new_alerts
 
         time.sleep(interval)
 
