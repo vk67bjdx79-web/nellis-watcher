@@ -63,7 +63,17 @@ ALGOLIA_HEADERS = {
     "Content-Type":             "application/json",
 }
 
-NELLIS_HOUSTON_URL = "https://www.nellisauction.com/browse?location=houston"
+NELLIS_BASE_URL    = "https://www.nellisauction.com"
+
+
+def _item_url(title: str, obj_id: str) -> str:
+    """Build a direct item URL: /p/Title-Slug/objectID"""
+    slug = re.sub(r"[^a-zA-Z0-9\s-]", "", title)   # strip special chars
+    slug = re.sub(r"\s+", "-", slug.strip())          # spaces → hyphens
+    slug = re.sub(r"-{2,}", "-", slug)                # collapse consecutive hyphens
+    if slug and obj_id:
+        return f"{NELLIS_BASE_URL}/p/{slug}/{obj_id}"
+    return f"{NELLIS_BASE_URL}/browse?location=houston"
 
 # ── Tuning knobs ──────────────────────────────────────────────────────────────
 MAX_BIDS        = 5
@@ -436,10 +446,7 @@ def check_and_alert(hits: list[dict], now: int) -> int:
         secs     = secs_left % 60
         time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
 
-        item_url = (
-            f"{NELLIS_HOUSTON_URL}&clerk={clerk_id}"
-            if clerk_id else NELLIS_HOUSTON_URL
-        )
+        item_url = _item_url(title_text, item.get("objectID", ""))
 
         # ── Stage 1: 5-minute alert ─────────────────────────────────────────
         if need_first:
