@@ -337,35 +337,62 @@ def send_pushover(
 
 # ── Algolia query ─────────────────────────────────────────────────────────────
 
-def fetch_qualifying_items(now: int) -> list[dict]:
+_RETRIEVE_ATTRS = [
+    "objectID",
+    "Lead Description",
+    "Suggested Retail",
+    "Time Remaining",
+    "Location Name",
+    "ClerkId",
+    "Photo",
+]
+_TIME_FILTERS = lambda now: [  # noqa: E731
+    f"Time Remaining>{now}",
+    f"Time Remaining<{now + LOOK_AHEAD}",
+    f"Suggested Retail>{MIN_RETAIL}",
+]
+
+
+def _algolia_query(numeric_filters: list[str]) -> list[dict]:
     payload = {
         "query": "",
         "facetFilters": [["Shopping Location:Houston, TX"]],
-        "numericFilters": [
-            f"Total Bids<={MAX_BIDS}",
-            f"Current Bid<={MAX_CURRENT_BID}",
-            f"Time Remaining>{now}",
-            f"Time Remaining<{now + LOOK_AHEAD}",
-            f"Suggested Retail>{MIN_RETAIL}",
-        ],
+        "numericFilters": numeric_filters,
         "hitsPerPage": 1000,
-        "attributesToRetrieve": [
-            "objectID",
-            "Lead Description",
-            "Suggested Retail",
-            "Time Remaining",
-            "Location Name",
-            "ClerkId",
-            "Photo",
-        ],
+        "attributesToRetrieve": _RETRIEVE_ATTRS,
     }
+    resp = requests.post(ALGOLIA_URL, headers=ALGOLIA_HEADERS, json=payload, timeout=15)
+    resp.raise_for_status()
+    return resp.json().get("hits", [])
+
+
+def fetch_qualifying_items(now: int) -> list[dict]:
+    """
+    Two queries merged by objectID:
+      Q1 — 0-bid items: no current-bid filter (bid may be null/missing/0)
+      Q2 — 1-5 bid items: must have Current Bid <= MAX_CURRENT_BID
+    """
+    time_filters = _TIME_FILTERS(now)
+    seen: dict[str, dict] = {}
+
+    # Q1: exactly 0 bids — pass regardless of current price
     try:
-        resp = requests.post(ALGOLIA_URL, headers=ALGOLIA_HEADERS, json=payload, timeout=15)
-        resp.raise_for_status()
-        return resp.json().get("hits", [])
+        for hit in _algolia_query(["Total Bids<=0"] + time_filters):
+            seen[hit["objectID"]] = hit
     except Exception as exc:
-        print(f"  [ERROR] Algolia query failed: {exc}")
-        return []
+        print(f"  [ERROR] Algolia Q1 (0-bid) failed: {exc}")
+
+    # Q2: 1-5 bids AND current bid within budget
+    try:
+        for hit in _algolia_query(
+            [f"Total Bids>={1}", f"Total Bids<={MAX_BIDS}",
+             f"Current Bid<={MAX_CURRENT_BID}"] + time_filters
+        ):
+            seen.setdefault(hit["objectID"], hit)
+    except Exception as exc:
+        print(f"  [ERROR] Algolia Q2 (1-{MAX_BIDS} bid) failed: {exc}")
+
+    return list(seen.values())
 
 
 # ── Two-stage alert logic ─────────────────────────────────────────────────────
